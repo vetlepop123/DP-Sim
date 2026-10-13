@@ -49,7 +49,6 @@ const LOSE_TIME = 10;   // s utenfor før spillet er over
 
 // Progressivt vær: hvert LEVEL_TIME ekte sekund går nivået opp, og vind, bølger, strøm og
 // vindkast øker med LEVEL_STEP (kreftene øker da med ca. det dobbelte, siden de går som kvadratet).
-const PROGRESSIVE = CFG.progressive !== false;
 const LEVEL_TIME = 30;
 const LEVEL_STEP = 0.06;
 
@@ -77,11 +76,6 @@ const THRUSTERS = [
     keys: { up: ['ArrowUp', 'Numpad8'], down: ['ArrowDown', 'Numpad5'],
             left: ['ArrowLeft', 'Numpad4'], right: ['ArrowRight', 'Numpad6'] } },
 ];
-const SELECT_KEYS = {
-  caps: { up: '↑', down: '↓', left: '←', right: '→' },
-  keys: { up: ['ArrowUp', 'KeyW'], down: ['ArrowDown', 'KeyS'],
-          left: ['ArrowLeft', 'KeyA'], right: ['ArrowRight', 'KeyD'] },
-};
 
 // Retro-palett: grønn fosfor, rav for bestilte verdier og varsler, rødt for alarm
 const COL = {
@@ -137,7 +131,7 @@ function outermost(N, E, psi) {
   return best;
 }
 
-const BEST_KEY = `dpsim_best_${WX.name}_${R}_${HEAD_RULE ? HTOL : 'fri'}_x${SPEED}${PROGRESSIVE ? '_prog' : ''}`;
+const BEST_KEY = `dpsim_best_${WX.name}_${R}_${HEAD_RULE ? HTOL : 'fri'}_x${SPEED}_prog`;
 function loadBest() {
   try { return parseFloat(localStorage.getItem(BEST_KEY)) || 0; } catch (e) { return 0; }
 }
@@ -151,7 +145,6 @@ function saveBest(v) {
 let S;
 let best = loadBest();
 let visT = 0;
-let selected = [true, false, false, false];
 
 function newGame(phase) {
   const windFrom = Math.random() * 2 * Math.PI;
@@ -194,15 +187,13 @@ function updateEnv(dt) {
     }
     e.windFromMean = wrapPi(e.windFromMean + wrapPi(e.windTarget - e.windFromMean) * Math.min(1, dt / 25));
   }
-  if (PROGRESSIVE) {
-    const level = 1 + Math.floor(S.clock / LEVEL_TIME);
-    if (level > S.level) {
-      S.level = level;
-      msg(`NIVÅ ${level}: VÆRET FORVERRES`, COL.amber);
-    }
-    const target = 1 + LEVEL_STEP * (S.level - 1);
-    S.sev += (target - S.sev) * Math.min(1, dt / 8);
+  const level = 1 + Math.floor(S.clock / LEVEL_TIME);
+  if (level > S.level) {
+    S.level = level;
+    msg(`NIVÅ ${level}: VÆRET FORVERRES`, COL.amber);
   }
+  const target = 1 + LEVEL_STEP * (S.level - 1);
+  S.sev += (target - S.sev) * Math.min(1, dt / 8);
   e.gust = ou(e.gust, WX.gust * S.sev, 12, dt);
   e.dirN = ou(e.dirN, WX.dirVar * DEG, 30, dt);
   e.windFrom = wrapPi(e.windFromMean + e.dirN);
@@ -276,20 +267,15 @@ const anyKey = codes => codes.some(c => keys.has(c));
 
 function applyInput(dt) {
   const f = keys.has('ShiftLeft') || keys.has('ShiftRight') ? FINE : 1;
-  const ctl = (i, k) => {
-    const th = S.thr[i];
+  THRUSTERS.forEach((d, i) => {
+    const th = S.thr[i], k = d.keys;
     if (anyKey(k.up)) th.cmd += THR_CMD_RATE * f * dt;
     if (anyKey(k.down)) th.cmd -= THR_CMD_RATE * f * dt;
     th.cmd = clamp(th.cmd, 0, 1);
     if (anyKey(k.left)) th.aziCmd -= AZI_CMD_RATE * f * dt;
     if (anyKey(k.right)) th.aziCmd += AZI_CMD_RATE * f * dt;
     th.aziCmd = wrapPi(th.aziCmd);
-  };
-  if (CFG.mode === 'direct') {
-    THRUSTERS.forEach((d, i) => ctl(i, d.keys));
-  } else {
-    selected.forEach((sel, i) => { if (sel) ctl(i, SELECT_KEYS.keys); });
-  }
+  });
 }
 
 function updateThrusters(dt) {
@@ -384,17 +370,6 @@ window.addEventListener('keydown', ev => {
     else S.phase = 'running';
   } else if (ev.code === 'KeyR' && p !== 'running') {
     newGame('running');
-  } else if (CFG.mode === 'select') {
-    const m = /^(Digit|Numpad)([1-5])$/.exec(ev.code);
-    if (m) {
-      const n = Number(m[2]);
-      if (n === 5) {
-        const all = selected.every(Boolean);
-        selected = selected.map(() => !all);
-      } else {
-        selected[n - 1] = !selected[n - 1];
-      }
-    }
   }
 });
 window.addEventListener('keyup', ev => keys.delete(ev.code));
@@ -549,7 +524,7 @@ function drawMap(mw, mh) {
 
   // Tid og alarm
   T(`TID ${fmtTime(S.clock)}`, mw / 2, 34, 34, COL.g, 'center');
-  T(`REKORD ${fmtTime(best)}${PROGRESSIVE ? `   NIVÅ ${S.level}` : ''}`, mw / 2, 54, 18, COL.dim, 'center');
+  T(`REKORD ${fmtTime(best)}   NIVÅ ${S.level}`, mw / 2, 54, 18, COL.dim, 'center');
   if (S.phase === 'running' && S.outside > 0) {
     const what = S.outPos && S.outHead ? 'OVER STREKEN + KURS' : S.outPos ? 'RIGGEN ER OVER STREKEN' : 'KURSAVVIK';
     if (blink) {
@@ -658,14 +633,13 @@ function drawThrusters(sc, P, rx, ry) {
   S.thr.forEach((th, i) => {
     const d = THRUSTERS[i];
     const [x, y] = P(S.N + d.x * c - d.y * s, S.E + d.x * s + d.y * c);
-    const sel = CFG.mode === 'select' && selected[i];
-    const col = th.failed > 0 ? COL.red : sel ? COL.amber : COL.g;
+    const col = th.failed > 0 ? COL.red : COL.g;
 
     // Pilene viser vannstrømmen fra thrusteren (riggen skyves motsatt vei).
     // Bestilt retning er stiplet rav, faktisk er blå pil.
     const ac = S.psi + th.aziCmd + Math.PI;
     line(x, y, x + Math.sin(ac) * (pod + 20), y - Math.cos(ac) * (pod + 20), COL.amber, 1, [2, 3]);
-    ring(x, y, pod, col, sel ? 2 : 1.5, null, COL.bg);
+    ring(x, y, pod, col, 1.5, null, COL.bg);
     const a = S.psi + th.azi + Math.PI;
     const len = pod + 4 + th.act * 40;
     if (th.act > 0.01) arrow(x, y, x + Math.sin(a) * len, y - Math.cos(a) * len, th.failed > 0 ? COL.red : COL.water, 2, 7);
@@ -675,9 +649,7 @@ function drawThrusters(sc, P, rx, ry) {
     const ol = Math.hypot(ox, oy) || 1;
     ox /= ol; oy /= ol;
     const lx = x + ox * (pod + 36), ly = y + oy * (pod + 30);
-    const hint = CFG.mode === 'direct'
-      ? `${d.caps.up}${d.caps.left}${d.caps.down}${d.caps.right}`
-      : `[${i + 1}]`;
+    const hint = `${d.caps.up}${d.caps.left}${d.caps.down}${d.caps.right}`;
     T(d.name, lx, ly, 24, col, 'center');
     T(hint, lx, ly + 20, 22, th.failed > 0 ? COL.red : COL.mid, 'center');
   });
@@ -766,9 +738,8 @@ function drawPanel(x0, w, h) {
   S.thr.forEach((th, i) => {
     const d = THRUSTERS[i];
     const ch = 94, y0 = y;
-    const sel = CFG.mode === 'select' && selected[i];
-    const bc = th.failed > 0 ? (blink ? COL.red : COL.dim) : sel ? COL.amber : COL.dim;
-    box(px, y0, pw, ch, bc, null, sel || th.failed > 0 ? 2 : 1);
+    const bc = th.failed > 0 ? (blink ? COL.red : COL.dim) : COL.dim;
+    box(px, y0, pw, ch, bc, null, th.failed > 0 ? 2 : 1);
 
     // Retningsskive (baug opp). Pilen viser vannstrømmen, som på kartet.
     const jet = th.azi + Math.PI, jetCmd = th.aziCmd + Math.PI;
@@ -794,20 +765,16 @@ function drawPanel(x0, w, h) {
 
     // Taster
     const kx = px + pw - 56, ky = y0 + ch / 2 + 2;
-    if (CFG.mode === 'direct') keyCluster(kx, ky, d, 32, th.failed > 0);
-    else keycap(kx, ky, String(i + 1), sel, 42);
+    keyCluster(kx, ky, d, 32, th.failed > 0);
     y += ch + 6;
   });
 
   // Forklaring av tastene
   const ky = y + 36, kx = px + 46;
-  keyCluster(kx, ky, CFG.mode === 'direct'
-    ? { caps: { up: '+', down: '-', left: '<', right: '>' }, keys: { up: [], down: [], left: [], right: [] } }
-    : SELECT_KEYS, 28, false);
+  keyCluster(kx, ky, { caps: { up: '+', down: '-', left: '<', right: '>' },
+                       keys: { up: [], down: [], left: [], right: [] } }, 28, false);
   const hx = px + 104;
-  const help = CFG.mode === 'direct'
-    ? ['ØVERST: MER PÅDRAG', 'MIDTEN: MINDRE PÅDRAG', 'VENSTRE/HØYRE: ROTER']
-    : ['1-4: VELG THRUSTER, 5: ALLE', '↑/↓: PÅDRAG', '←/→: ROTER'];
+  const help = ['ØVERST: MER PÅDRAG', 'MIDTEN: MINDRE PÅDRAG', 'VENSTRE/HØYRE: ROTER'];
   help.forEach((l, k) => T(l, hx, y + 20 + k * 18, 18, COL.mid));
   T('SHIFT: FINJUSTER  MELLOMROM: PAUSE', hx, y + 20 + 3 * 18, 16, COL.dim);
 }
@@ -845,18 +812,12 @@ function drawOverlay(mw, mh) {
 
   let lines;
   if (S.phase === 'intro') {
-    const ctrl = CFG.mode === 'direct'
-      ? [
-        'HVER THRUSTER HAR FIRE TASTER I EN OMVENDT T:',
-        '  T1 BAUG BB : W A S D    T2 BAUG SB : I J K L',
-        '  T3 AKTER BB: T F G H    T4 AKTER SB: ↑ ← ↓ →',
-        'ØVERST = MER PÅDRAG, MIDTEN = MINDRE, SIDENE = ROTER.',
-      ]
-      : [
-        '1-4: VELG ELLER FJERN THRUSTER (5 = ALLE)',
-        '↑/↓: PÅDRAG FOR VALGTE',
-        '←/→: ROTER VALGTE',
-      ];
+    const ctrl = [
+      'HVER THRUSTER HAR FIRE TASTER I EN OMVENDT T:',
+      '  T1 BAUG BB : W A S D    T2 BAUG SB : I J K L',
+      '  T3 AKTER BB: T F G H    T4 AKTER SB: ↑ ← ↓ →',
+      'ØVERST = MER PÅDRAG, MIDTEN = MINDRE, SIDENE = ROTER.',
+    ];
     lines = [
       { t: 'DP-SIMULATOR : SEMISUB', s: 40, a: 'center', gap: 2 },
       { t: `VÆR ${WX.name.toUpperCase()}  RADIUS ${R} M  ${HEAD_RULE ? `KURS 000° ±${HTOL}°` : 'KURSREGEL AV'}`, s: 20, c: COL.amber, a: 'center', gap: 14 },
@@ -867,7 +828,7 @@ function drawOverlay(mw, mh) {
         { t: 'HOLD HELE RIGGEN INNENFOR STREKEN. KURSEN ER FRI, MEN NÅR RIGGEN DREIER, FLYTTER HJØRNENE SEG.', gap: 4 },
         { t: `GÅR EN DEL AV RIGGEN OVER STREKEN I MER ENN ${LOSE_TIME} S, ER SPILLET OVER.`, gap: 4 },
       ]),
-      ...(PROGRESSIVE ? [{ t: `VÆRET BLIR VERRE HVERT ${LEVEL_TIME}. SEKUND. HVOR LENGE HOLDER DU UT?`, c: COL.amber, gap: 4 }] : []),
+      { t: `VÆRET BLIR VERRE HVERT ${LEVEL_TIME}. SEKUND. HVOR LENGE HOLDER DU UT?`, c: COL.amber, gap: 4 },
       { t: 'BLÅ PIL PÅ THRUSTER = VANNSTRØMMEN, RIGGEN SKYVES MOTSATT VEI. RAV STIPLET = BESTILT RETNING. STOR BLÅ PIL I MIDTEN = SAMLET THRUSTERKRAFT PÅ RIGGEN.', gap: 14 },
       ...ctrl.map(t => ({ t, c: COL.mid })),
       { t: '', gap: 6 },
@@ -887,7 +848,7 @@ function drawOverlay(mw, mh) {
       S.newBest
         ? { t: '*** NY REKORD ***', s: 24, c: COL.amber, a: 'center' }
         : { t: `REKORD ${fmtTime(best)}`, c: COL.mid, a: 'center' },
-      { t: `MINSTE KLARING ${S.minClear.toFixed(1)} M${PROGRESSIVE ? `   NÅDDE NIVÅ ${S.level}` : ''}`, c: COL.mid, a: 'center', gap: 4 },
+      { t: `MINSTE KLARING ${S.minClear.toFixed(1)} M   NÅDDE NIVÅ ${S.level}`, c: COL.mid, a: 'center', gap: 4 },
       { t: 'RESULTATET ER SENDT TIL LEDERTAVLEN UNDER SPILLET', s: 18, c: COL.dim, a: 'center', gap: 14 },
       { t: blink ? '> KLIKK, MELLOMROM ELLER R FOR NY RUNDE <' : '', s: 22, c: COL.amber, a: 'center' },
     ];

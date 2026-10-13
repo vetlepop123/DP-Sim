@@ -34,20 +34,13 @@ export default function(component) {
 """
 result_bridge = components_v2.component("dpsim_result_bridge", js=RESULT_BRIDGE_JS)
 
-# Værnivåer. wind [m/s], gust = relativt standardavvik på vindkast,
-# hs = signifikant bølgehøyde [m], current [m/s], dir_var = vindretningsstøy [grader],
-# shift = tilfeldige værskifter der vinden dreier 30-90 grader.
-WEATHER = {
-    "Storm": dict(wind=25, gust=0.20, hs=8.0, current=0.9, dir_var=16, shift=True,
-                  desc="Full storm, høy sjø og sterk strøm. Thrusterne må jobbe hardt."),
-    "Orkan": dict(wind=31, gust=0.22, hs=10.0, current=1.0, dir_var=20, shift=True,
-                  desc="Ekstremvær. Vindkastene kan bli sterkere enn thrusterne. Hvor lenge holder du?"),
-}
-
-CONTROL_MODES = {
-    "Direkte (4 taster per thruster)": "direct",
-    "Velg thruster (1–4 + piltaster)": "select",
-}
+# Startvær: Orkan. Været blir verre hvert 30. sekund (se LEVEL_TIME i game.html).
+# wind [m/s], gust = relativt standardavvik på vindkast, hs = signifikant bølgehøyde [m],
+# current [m/s], dir_var = vindretningsstøy [grader], shift = værskifter der vinden dreier 30-90 grader.
+WEATHER_NAME = "Orkan"
+WEATHER = dict(wind=31, gust=0.22, hs=10.0, current=1.0, dir_var=20, shift=True)
+# Riggens ytterste punkt er ca. 69 m fra senter, så radius 100 gir ca. 31 m å gå på.
+RADIUS = 100
 
 st.set_page_config(page_title="DP-simulator", page_icon="⚓", layout="wide")
 
@@ -55,17 +48,11 @@ with st.sidebar:
     st.text_input("Spillernavn (til ledertavlen)", key="player_name", max_chars=leaderboard.NAME_MAX,
                   placeholder="Skriv navnet ditt")
     st.header("Innstillinger")
-    level = st.radio("Vær", list(WEATHER), index=list(WEATHER).index("Orkan"), horizontal=True)
-    w = WEATHER[level]
-    st.caption(w["desc"])
-    progressive = st.checkbox("Progressivt vær (blir verre hvert 30. sekund)", value=True)
     st.caption(
-        f"Vind {w['wind']} m/s · Hs {w['hs']} m · strøm {w['current']} m/s"
-        + (" · værskifter" if w["shift"] else "")
+        f"Starter i {WEATHER_NAME.lower()} (vind {WEATHER['wind']} m/s, Hs {WEATHER['hs']} m, "
+        f"strøm {WEATHER['current']} m/s), og været blir verre hvert 30. sekund. "
+        f"Sirkelen har radius {RADIUS} m."
     )
-    mode_label = st.radio("Kontrollmodus", list(CONTROL_MODES))
-    # Riggens ytterste punkt er ca. 69 m fra senter, så radius 100 gir ca. 31 m å gå på.
-    radius = st.slider("Sirkelradius [m]", 80, 220, 100, step=10)
     heading_rule = st.checkbox("Kursregel (tap ved kursavvik)", value=False)
     heading_tol = st.slider("Kurstoleranse [± grader]", 5, 20, 10) if heading_rule else 10
     speed = st.slider("Spillhastighet [x sanntid]", 1.0, 3.0, 1.5, step=0.25)
@@ -80,32 +67,30 @@ st.write(
 )
 
 # Ledertavlen har én liste per kombinasjon av innstillinger som påvirker vanskeligheten
+# (Formatet er det samme som før vær, radius og progressivt vær ble låst, så gamle resultater står.)
 category = "-".join(
-    [level.lower(), f"r{radius}", f"x{speed:g}", "prog" if progressive else "fast",
+    [WEATHER_NAME.lower(), f"r{RADIUS}", f"x{speed:g}", "prog",
      f"kurs{heading_tol}" if heading_rule else "kursfri"]
     + (["feil"] if failures else [])
 )
 category_label = " · ".join(
-    [level, f"{radius} m", f"{speed:g}x fart", "progressivt vær" if progressive else "fast vær",
-     f"kurs ±{heading_tol}°" if heading_rule else "uten kursregel"]
+    [f"{speed:g}x fart", f"kurs ±{heading_tol}°" if heading_rule else "uten kursregel"]
     + (["thrusterfeil"] if failures else [])
 )
 
 config = {
     "category": category,
     "weather": {
-        "name": level,
-        "wind": w["wind"],
-        "gust": w["gust"],
-        "hs": w["hs"],
-        "current": w["current"],
-        "dirVar": w["dir_var"],
-        "shift": w["shift"],
+        "name": WEATHER_NAME,
+        "wind": WEATHER["wind"],
+        "gust": WEATHER["gust"],
+        "hs": WEATHER["hs"],
+        "current": WEATHER["current"],
+        "dirVar": WEATHER["dir_var"],
+        "shift": WEATHER["shift"],
     },
-    "mode": CONTROL_MODES[mode_label],
-    "radius": radius,
+    "radius": RADIUS,
     "speed": speed,
-    "progressive": progressive,
     "headingRule": heading_rule,
     "headingTol": heading_tol,
     "showForces": show_forces,
@@ -129,9 +114,9 @@ if isinstance(result, dict) and result.get("id") not in saved_ids:
             "level": int(min(max(result.get("level", 1), 1), 10000)),
             "category": str(result.get("category", category))[:100],
             # Innstillingene runden ble spilt med (kategorien kommer fra spillet selv)
-            "settings": {"weather": level, "radius": radius, "speed": speed, "progressive": progressive,
+            "settings": {"weather": WEATHER_NAME, "radius": RADIUS, "speed": speed, "progressive": True,
                          "heading_rule": heading_rule, "heading_tol": heading_tol, "failures": failures,
-                         "mode": config["mode"]},
+                         "mode": "direct"},
         }
     except (KeyError, TypeError, ValueError):
         pass
@@ -155,7 +140,7 @@ if pending and pending["id"] not in saved_ids:
                    "så lagres resultatet på ledertavlen.")
 
 st.subheader("🏆 Ledertavle")
-st.caption(f"{category_label}. Hver kombinasjon av innstillinger har sin egen liste.")
+st.caption(f"{category_label}. Disse innstillingene har sin egen liste.")
 try:
     rows = leaderboard.top_scores(category)
 except Exception as e:
@@ -181,23 +166,16 @@ if leaderboard.backend_name() != "Supabase":
 col1, col2 = st.columns(2)
 with col1:
     with st.expander("Kontroller", expanded=False):
-        if config["mode"] == "direct":
-            st.markdown(
-                "Hver thruster har fire taster i en omvendt T, som på tastaturet. "
-                "Øverste tast gir mer pådrag, midterste gir mindre, og venstre/høyre roterer.\n\n"
-                "| Thruster | Mer / mindre pådrag | Roter mot / med klokka |\n"
-                "|---|---|---|\n"
-                "| T1 baug babord | W / S | A / D |\n"
-                "| T2 baug styrbord | I / K | J / L |\n"
-                "| T3 akter babord | T / G | F / H |\n"
-                "| T4 akter styrbord | ↑ / ↓ | ← / → |"
-            )
-        else:
-            st.markdown(
-                "- **1–4**: velg eller fjern en thruster (flere kan være valgt samtidig), **5**: alle\n"
-                "- **↑ / ↓** eller **W / S**: pådrag for valgte thrustere\n"
-                "- **← / →** eller **A / D**: roter valgte thrustere"
-            )
+        st.markdown(
+            "Hver thruster har fire taster i en omvendt T, som på tastaturet. "
+            "Øverste tast gir mer pådrag, midterste gir mindre, og venstre/høyre roterer.\n\n"
+            "| Thruster | Mer / mindre pådrag | Roter mot / med klokka |\n"
+            "|---|---|---|\n"
+            "| T1 baug babord | W / S | A / D |\n"
+            "| T2 baug styrbord | I / K | J / L |\n"
+            "| T3 akter babord | T / G | F / H |\n"
+            "| T4 akter styrbord | ↑ / ↓ | ← / → |"
+        )
         st.markdown(
             "- **Shift**: finjustering\n"
             "- **Mellomrom**: pause / fortsett\n"
