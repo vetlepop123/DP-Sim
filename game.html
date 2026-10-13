@@ -1,0 +1,917 @@
+<!doctype html>
+<html lang="no">
+<head>
+<meta charset="utf-8">
+<link href="https://fonts.googleapis.com/css2?family=VT323&display=swap" rel="stylesheet">
+<style>
+  html, body { margin: 0; padding: 0; background: #000805; overflow: hidden; }
+  canvas { display: block; outline: none; }
+</style>
+</head>
+<body>
+<canvas id="c" tabindex="0"></canvas>
+<script>
+"use strict";
+// Konfigurasjon settes inn av simulator.py
+const CFG = __CONFIG__;
+
+const DEG = Math.PI / 180;
+const WX = CFG.weather;
+const R = CFG.radius;
+const HTOL = CFG.headingTol;
+const HEAD_RULE = CFG.headingRule !== false;   // av = man kan ikke tape på kurs
+
+// ---------------------------------------------------------------------------
+// Fysiske konstanter (semisub, ca. 116 x 86 m, 3 frihetsgrader: N, Ø, kurs)
+// ---------------------------------------------------------------------------
+const MASS = 5.0e7;        // kg, inkl. tilleggsmasse
+const IZ = 8.0e10;         // kg m^2, treghetsmoment om vertikalaksen
+const K_WIND = 2000;       // N/(m/s)^2  vindkraft = K * U^2
+const K_WAVE = 16000;      // N/m^2      bølgedrift = K * Hs^2
+const K_CUR = 6.0e5;       // N/(m/s)^2  kvadratisk demping mot vannet
+const D_LIN = 3.0e5;       // N/(m/s)    lineær demping
+const N_LIN = 3.0e9;       // Nm/(rad/s) lineær girdemping
+const N_QUAD = 4.0e11;     // Nm/(rad/s)^2
+const WIND_ARM = 10;       // m, angrepspunkt for vind foran senter
+const WAVE_ARM = -6;       // m, angrepspunkt for bølgedrift
+const T_MAX = 1.8e6;       // N maks skyvekraft per thruster
+const SPEED = CFG.speed || 1;   // simulerte sekunder per ekte sekund
+
+const THR_CMD_RATE = 0.4;        // bestilt pådrag, andel per sekund
+const AZI_CMD_RATE = 60 * DEG;   // bestilt retning, rad per sekund
+const THR_UP_RATE = 0.2;         // faktisk pådrag opp, andel per sekund
+const THR_DOWN_RATE = 0.35;
+const AZI_RATE = 25 * DEG;       // faktisk rotasjonshastighet
+const FINE = 0.25;               // faktor med Shift holdt inne
+
+const RAMP_TIME = 15;   // s før været er fullt utviklet
+const LOSE_TIME = 10;   // s utenfor før spillet er over
+
+// Progressivt vær: hvert LEVEL_TIME ekte sekund går nivået opp, og vind, bølger, strøm og
+// vindkast øker med LEVEL_STEP (kreftene øker da med ca. det dobbelte, siden de går som kvadratet).
+const PROGRESSIVE = CFG.progressive !== false;
+const LEVEL_TIME = 30;
+const LEVEL_STEP = 0.06;
+
+// Riggens omriss (x = forover, y = styrbord). Nøyaktig det samme omrisset tegnes på skjermen
+// og brukes for å sjekke om noe av riggen er utenfor sirkelen.
+const PONTOON_Y = 35, PONTOON_HALF_LEN = 58, PONTOON_R = 8;   // pongtonger med avrundede ender
+const PONTOON_ENDS = [[50, -35], [50, 35], [-50, -35], [-50, 35]];
+const DECK_X = 44, DECK_Y = 42;
+const DECK_CORNERS = [[DECK_X, -DECK_Y], [DECK_X, DECK_Y], [-DECK_X, -DECK_Y], [-DECK_X, DECK_Y]];
+const RIG_RADIUS = Math.hypot(50, 35) + PONTOON_R;
+
+// azi0 = startretning. caps = tastene slik de står på tastaturet (omvendt T).
+const THRUSTERS = [
+  { name: 'T1', label: 'BAUG BB',  x:  50, y: -35, azi0: -45 * DEG,
+    caps: { up: 'W', down: 'S', left: 'A', right: 'D' },
+    keys: { up: ['KeyW'], down: ['KeyS'], left: ['KeyA'], right: ['KeyD'] } },
+  { name: 'T2', label: 'BAUG SB',  x:  50, y:  35, azi0:  45 * DEG,
+    caps: { up: 'I', down: 'K', left: 'J', right: 'L' },
+    keys: { up: ['KeyI'], down: ['KeyK'], left: ['KeyJ'], right: ['KeyL'] } },
+  { name: 'T3', label: 'AKTER BB', x: -50, y: -35, azi0: -135 * DEG,
+    caps: { up: 'T', down: 'G', left: 'F', right: 'H' },
+    keys: { up: ['KeyT'], down: ['KeyG'], left: ['KeyF'], right: ['KeyH'] } },
+  { name: 'T4', label: 'AKTER SB', x: -50, y:  35, azi0: 135 * DEG,
+    caps: { up: '↑', down: '↓', left: '←', right: '→' },
+    keys: { up: ['ArrowUp', 'Numpad8'], down: ['ArrowDown', 'Numpad5'],
+            left: ['ArrowLeft', 'Numpad4'], right: ['ArrowRight', 'Numpad6'] } },
+];
+const SELECT_KEYS = {
+  caps: { up: '↑', down: '↓', left: '←', right: '→' },
+  keys: { up: ['ArrowUp', 'KeyW'], down: ['ArrowDown', 'KeyS'],
+          left: ['ArrowLeft', 'KeyA'], right: ['ArrowRight', 'KeyD'] },
+};
+
+// Retro-palett: grønn fosfor, rav for bestilte verdier og varsler, rødt for alarm
+const COL = {
+  bg: '#000805', grid: '#062612', dim: '#1d7a36', mid: '#2fbf57', g: '#46ff7a',
+  amber: '#ffb000', red: '#ff3b3b', water: '#4fd8ff', black: '#000805',
+};
+const FONT = '"VT323", Consolas, monospace';
+
+// ---------------------------------------------------------------------------
+// Hjelpefunksjoner
+// ---------------------------------------------------------------------------
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+function wrapPi(a) {
+  a = (a + Math.PI) % (2 * Math.PI);
+  if (a < 0) a += 2 * Math.PI;
+  return a - Math.PI;
+}
+function gauss() {
+  let u = 0;
+  while (!u) u = Math.random();
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * Math.random());
+}
+// Ornstein-Uhlenbeck: tregt varierende støy med standardavvik sigma og tidskonstant tau
+function ou(x, sigma, tau, dt) {
+  return x - x * dt / tau + sigma * Math.sqrt(2 * dt / tau) * gauss();
+}
+const compass = a => ((a / DEG) % 360 + 360) % 360;
+const fmt3 = a => String(Math.round(compass(a)) % 360).padStart(3, '0');
+const fmtHdg = a => {
+  const s = compass(a).toFixed(1);
+  return s === '360.0' ? '000.0' : s.padStart(5, '0');
+};
+function fmtTime(t) {
+  const m = Math.floor(t / 60), s = Math.floor(t % 60);
+  return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+}
+
+// Punktet på riggen som er lengst fra brønnen: { d, n, e }
+function outermost(N, E, psi) {
+  const c = Math.cos(psi), s = Math.sin(psi);
+  let best = { d: -1, n: 0, e: 0 };
+  for (const [x, y] of PONTOON_ENDS) {
+    const n = N + x * c - y * s, e = E + x * s + y * c;
+    const r = Math.hypot(n, e) || 1e-9;
+    const d = r + PONTOON_R;
+    if (d > best.d) best = { d, n: n * d / r, e: e * d / r };
+  }
+  for (const [x, y] of DECK_CORNERS) {
+    const n = N + x * c - y * s, e = E + x * s + y * c;
+    const d = Math.hypot(n, e);
+    if (d > best.d) best = { d, n, e };
+  }
+  return best;
+}
+
+const BEST_KEY = `dpsim_best_${WX.name}_${R}_${HEAD_RULE ? HTOL : 'fri'}_x${SPEED}${PROGRESSIVE ? '_prog' : ''}`;
+function loadBest() {
+  try { return parseFloat(localStorage.getItem(BEST_KEY)) || 0; } catch (e) { return 0; }
+}
+function saveBest(v) {
+  try { localStorage.setItem(BEST_KEY, String(v)); } catch (e) { /* ignorer */ }
+}
+
+// ---------------------------------------------------------------------------
+// Spilltilstand
+// ---------------------------------------------------------------------------
+let S;
+let best = loadBest();
+let visT = 0;
+let selected = [true, false, false, false];
+
+function newGame(phase) {
+  const windFrom = Math.random() * 2 * Math.PI;
+  const waveOffset = (Math.random() * 40 - 20) * DEG;
+  S = {
+    phase, t: 0, clock: 0,   // t = simulert tid, clock = ekte spilletid (poengsum)
+    N: 0, E: 0, vN: 0, vE: 0, psi: 0, r: 0,
+    thr: THRUSTERS.map(d => ({ cmd: 0, act: 0, aziCmd: d.azi0, azi: d.azi0, failed: 0 })),
+    env: {
+      windTarget: windFrom, windFromMean: windFrom, windFrom, gust: 0, dirN: 0,
+      waveOffset, waveFrom: wrapPi(windFrom + waveOffset), waveSlow: 0,
+      curTo: Math.random() * 2 * Math.PI, curN: 0, curDirN: 0,
+      shiftTimer: 60 + Math.random() * 60,
+      failTimer: 35 + Math.random() * 40,
+    },
+    F: null, outside: 0, outPos: false, outHead: false,
+    clear: R - RIG_RADIUS, minClear: R - RIG_RADIUS,
+    level: 1, sev: 1,   // værnivå og glidende værfaktor
+    msgs: [], title: '', reason: '', newBest: false,
+  };
+  S.F = computeForces();
+}
+
+function msg(text, color) {
+  S.msgs.push({ text, color, t: 5 });
+}
+
+// ---------------------------------------------------------------------------
+// Miljø: vind med kast og værskifter, bølgedrift og strøm
+// ---------------------------------------------------------------------------
+function updateEnv(dt) {
+  const e = S.env;
+  if (WX.shift) {
+    e.shiftTimer -= dt;
+    if (e.shiftTimer <= 0) {
+      e.shiftTimer = 70 + Math.random() * 80;
+      const d = (30 + Math.random() * 60) * DEG * (Math.random() < 0.5 ? -1 : 1);
+      e.windTarget = wrapPi(e.windTarget + d);
+      msg(`VÆRSKIFTE: VINDEN DREIER ${Math.round(Math.abs(d / DEG))}° ${d > 0 ? 'MED' : 'MOT'} KLOKKA`, COL.amber);
+    }
+    e.windFromMean = wrapPi(e.windFromMean + wrapPi(e.windTarget - e.windFromMean) * Math.min(1, dt / 25));
+  }
+  if (PROGRESSIVE) {
+    const level = 1 + Math.floor(S.clock / LEVEL_TIME);
+    if (level > S.level) {
+      S.level = level;
+      msg(`NIVÅ ${level}: VÆRET FORVERRES`, COL.amber);
+    }
+    const target = 1 + LEVEL_STEP * (S.level - 1);
+    S.sev += (target - S.sev) * Math.min(1, dt / 8);
+  }
+  e.gust = ou(e.gust, WX.gust * S.sev, 12, dt);
+  e.dirN = ou(e.dirN, WX.dirVar * DEG, 30, dt);
+  e.windFrom = wrapPi(e.windFromMean + e.dirN);
+  // Bølgene følger vindretningen sakte
+  e.waveFrom = wrapPi(e.waveFrom + wrapPi(e.windFromMean + e.waveOffset - e.waveFrom) * Math.min(1, dt / 90));
+  e.waveSlow = ou(e.waveSlow, 0.3, 25, dt);
+  e.curN = ou(e.curN, 0.1, 120, dt);
+  e.curDirN = ou(e.curDirN, 8 * DEG, 200, dt);
+
+  if (CFG.failures) {
+    e.failTimer -= dt;
+    if (e.failTimer <= 0 && !S.thr.some(t => t.failed > 0)) {
+      const i = Math.floor(Math.random() * 4);
+      S.thr[i].failed = 20 + Math.random() * 15;
+      e.failTimer = 45 + Math.random() * 60;
+      msg(`ALARM: ${THRUSTERS[i].name} ${THRUSTERS[i].label} HAR FALT UT`, COL.red);
+    }
+  }
+}
+
+function computeForces() {
+  const e = S.env;
+  const ramp = Math.min(1, S.t / RAMP_TIME);
+
+  const ws = WX.wind * S.sev * Math.max(0, 1 + e.gust);
+  const hs = WX.hs * S.sev;
+  const wTo = e.windFrom + Math.PI;
+  const fw = K_WIND * ws * ws * ramp;
+  const FwN = fw * Math.cos(wTo), FwE = fw * Math.sin(wTo);
+
+  const wvTo = e.waveFrom + Math.PI;
+  const fwv = K_WAVE * hs * hs * Math.max(0, 1 + e.waveSlow) * ramp;
+  const FvN = fwv * Math.cos(wvTo), FvE = fwv * Math.sin(wvTo);
+
+  // Strøm: demping på riggens fart relativt til vannet
+  const cs = WX.current * S.sev * Math.max(0, 1 + e.curN) * ramp;
+  const cTo = e.curTo + e.curDirN;
+  const vrN = S.vN - cs * Math.cos(cTo), vrE = S.vE - cs * Math.sin(cTo);
+  const kd = K_CUR * Math.hypot(vrN, vrE) + D_LIN;
+  const FcN = -kd * vrN, FcE = -kd * vrE;
+
+  const c = Math.cos(S.psi), s = Math.sin(S.psi);
+  const yBody = (n, ea) => -n * s + ea * c;
+  const Menv = yBody(FwN, FwE) * WIND_ARM + yBody(FvN, FvE) * WAVE_ARM
+             - (N_LIN + N_QUAD * Math.abs(S.r)) * S.r;
+
+  let Tx = 0, Ty = 0, Tm = 0;
+  S.thr.forEach((th, i) => {
+    const d = THRUSTERS[i];
+    const T = th.act * T_MAX;
+    const fx = T * Math.cos(th.azi), fy = T * Math.sin(th.azi);
+    Tx += fx; Ty += fy; Tm += d.x * fy - d.y * fx;
+  });
+  const TN = Tx * c - Ty * s, TE = Tx * s + Ty * c;
+
+  // Strømkraft på en rigg i ro (kun for visning)
+  const cStat = K_CUR * cs * cs + D_LIN * cs;
+  return {
+    ws, hs, cs, cTo,
+    FN: FwN + FvN + FcN + TN, FE: FwE + FvE + FcE + TE, Mz: Menv + Tm,
+    envN: FwN + FvN + cStat * Math.cos(cTo), envE: FwE + FvE + cStat * Math.sin(cTo),
+    TN, TE,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Styring og thrusterdynamikk
+// ---------------------------------------------------------------------------
+const keys = new Set();
+const anyKey = codes => codes.some(c => keys.has(c));
+
+function applyInput(dt) {
+  const f = keys.has('ShiftLeft') || keys.has('ShiftRight') ? FINE : 1;
+  const ctl = (i, k) => {
+    const th = S.thr[i];
+    if (anyKey(k.up)) th.cmd += THR_CMD_RATE * f * dt;
+    if (anyKey(k.down)) th.cmd -= THR_CMD_RATE * f * dt;
+    th.cmd = clamp(th.cmd, 0, 1);
+    if (anyKey(k.left)) th.aziCmd -= AZI_CMD_RATE * f * dt;
+    if (anyKey(k.right)) th.aziCmd += AZI_CMD_RATE * f * dt;
+    th.aziCmd = wrapPi(th.aziCmd);
+  };
+  if (CFG.mode === 'direct') {
+    THRUSTERS.forEach((d, i) => ctl(i, d.keys));
+  } else {
+    selected.forEach((sel, i) => { if (sel) ctl(i, SELECT_KEYS.keys); });
+  }
+}
+
+function updateThrusters(dt) {
+  S.thr.forEach((th, i) => {
+    if (th.failed > 0) {
+      th.failed -= dt;
+      if (th.failed <= 0) {
+        th.failed = 0;
+        msg(`${THRUSTERS[i].name} ER TILBAKE I DRIFT`, COL.g);
+      }
+    }
+    const target = th.failed > 0 ? 0 : th.cmd;
+    if (th.act < target) th.act = Math.min(target, th.act + THR_UP_RATE * dt);
+    else th.act = Math.max(target, th.act - (th.failed > 0 ? 1 : THR_DOWN_RATE) * dt);
+    const step = AZI_RATE * dt;
+    th.azi = wrapPi(th.azi + clamp(wrapPi(th.aziCmd - th.azi), -step, step));
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Simuleringssteg og spillregler
+// ---------------------------------------------------------------------------
+function step(dt) {
+  S.t += dt;
+  updateEnv(dt);
+  applyInput(dt);
+  updateThrusters(dt);
+
+  const F = S.F = computeForces();
+  S.vN += F.FN / MASS * dt;
+  S.vE += F.FE / MASS * dt;
+  S.r += F.Mz / IZ * dt;
+  S.N += S.vN * dt;
+  S.E += S.vE * dt;
+  S.psi = wrapPi(S.psi + S.r * dt);
+
+  S.msgs.forEach(m => { m.t -= dt; });
+  S.msgs = S.msgs.filter(m => m.t > 0);
+
+  const hErr = Math.abs(wrapPi(S.psi)) / DEG;
+  S.clear = R - outermost(S.N, S.E, S.psi).d;
+  S.minClear = Math.min(S.minClear, S.clear);
+  S.outPos = S.clear < 0;
+  S.outHead = HEAD_RULE && hErr > HTOL;
+  // Nedtellingen går i ekte sekunder, uavhengig av spillhastigheten
+  S.outside = (S.outPos || S.outHead) ? S.outside + dt / SPEED : 0;
+
+  if (HEAD_RULE && hErr > 3 * HTOL) {
+    gameOver('NØDFRAKOBLING', `KURSAVVIKET BLE ${hErr.toFixed(0)}° (GRENSE ${3 * HTOL}°). RISEREN MÅTTE KOBLES FRA.`);
+  } else if (S.outside > LOSE_TIME) {
+    gameOver('SPILLET ER OVER', S.outPos
+      ? `RIGGEN VAR OVER STREKEN I MER ENN ${LOSE_TIME} SEKUNDER.`
+      : `KURSEN VAR UTENFOR ±${HTOL}° I MER ENN ${LOSE_TIME} SEKUNDER.`);
+  }
+}
+
+function gameOver(title, reason) {
+  S.phase = 'over';
+  S.title = title;
+  S.reason = reason;
+  if (S.clock > best) {
+    best = S.clock;
+    saveBest(best);
+    S.newBest = true;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Tastatur og mus
+// ---------------------------------------------------------------------------
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+window.addEventListener('keydown', ev => {
+  if (ev.code.startsWith('Arrow') || ev.code === 'Space' || ev.code.startsWith('Numpad')) ev.preventDefault();
+  keys.add(ev.code);
+  if (ev.repeat) return;
+  const p = S.phase;
+  if (ev.code === 'Space') {
+    if (p === 'running') S.phase = 'paused';
+    else if (p === 'over') newGame('running');
+    else S.phase = 'running';
+  } else if (ev.code === 'KeyR' && p !== 'running') {
+    newGame('running');
+  } else if (CFG.mode === 'select') {
+    const m = /^(Digit|Numpad)([1-5])$/.exec(ev.code);
+    if (m) {
+      const n = Number(m[2]);
+      if (n === 5) {
+        const all = selected.every(Boolean);
+        selected = selected.map(() => !all);
+      } else {
+        selected[n - 1] = !selected[n - 1];
+      }
+    }
+  }
+});
+window.addEventListener('keyup', ev => keys.delete(ev.code));
+window.addEventListener('blur', () => {
+  keys.clear();
+  if (S.phase === 'running') S.phase = 'paused';
+});
+canvas.addEventListener('mousedown', () => {
+  canvas.focus();
+  if (S.phase === 'intro' || S.phase === 'paused') S.phase = 'running';
+  else if (S.phase === 'over') newGame('running');
+});
+
+// ---------------------------------------------------------------------------
+// Tegning (enkel retro-stil: strektegning på svart bakgrunn)
+// ---------------------------------------------------------------------------
+let CW = 0, CH = 0;
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  CW = window.innerWidth;
+  CH = window.innerHeight || CFG.height;
+  canvas.width = CW * dpr;
+  canvas.height = CH * dpr;
+  canvas.style.width = CW + 'px';
+  canvas.style.height = CH + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener('resize', resize);
+resize();
+
+function T(str, x, y, size = 18, color = COL.g, align = 'left') {
+  ctx.font = `${size}px ${FONT}`;
+  ctx.fillStyle = color;
+  ctx.textAlign = align;
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillText(str, x, y);
+}
+function box(x, y, w, h, stroke, fill = null, lw = 1) {
+  if (fill) { ctx.fillStyle = fill; ctx.fillRect(x, y, w, h); }
+  ctx.strokeStyle = stroke;
+  ctx.lineWidth = lw;
+  ctx.strokeRect(Math.round(x) + 0.5, Math.round(y) + 0.5, Math.round(w), Math.round(h));
+}
+function line(x0, y0, x1, y1, color, lw = 1, dash = null) {
+  ctx.strokeStyle = color;
+  ctx.lineWidth = lw;
+  ctx.setLineDash(dash || []);
+  ctx.beginPath();
+  ctx.moveTo(x0, y0);
+  ctx.lineTo(x1, y1);
+  ctx.stroke();
+  ctx.setLineDash([]);
+}
+function arrow(x0, y0, x1, y1, color, lw = 2, head = 8) {
+  const a = Math.atan2(y1 - y0, x1 - x0);
+  line(x0, y0, x1, y1, color, lw);
+  line(x1, y1, x1 - head * Math.cos(a - 0.5), y1 - head * Math.sin(a - 0.5), color, lw);
+  line(x1, y1, x1 - head * Math.cos(a + 0.5), y1 - head * Math.sin(a + 0.5), color, lw);
+}
+function ring(x, y, r, color, lw = 1, dash = null, fill = null) {
+  ctx.beginPath();
+  ctx.arc(x, y, r, 0, 2 * Math.PI);
+  if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+  ctx.strokeStyle = color;
+  ctx.lineWidth = lw;
+  ctx.setLineDash(dash || []);
+  ctx.stroke();
+  ctx.setLineDash([]);
+}
+// Segmentert stolpe, som på gamle instrumenter
+function segBar(x, y, w, h, frac, color, n = 20) {
+  const gap = 2, sw = (w - gap * (n - 1)) / n;
+  const lit = Math.round(clamp(frac, 0, 1) * n);
+  for (let k = 0; k < n; k++) {
+    ctx.fillStyle = k < lit ? color : COL.grid;
+    ctx.fillRect(x + k * (sw + gap), y, sw, h);
+  }
+}
+// En tastaturknapp. lit = tasten holdes nede / thrusteren er valgt.
+function keycap(x, y, label, lit, size = 22, dim = false) {
+  const col = dim ? COL.dim : lit ? COL.amber : COL.g;
+  box(x - size / 2, y - size / 2, size, size, col, lit ? COL.amber : COL.black, 1);
+  T(label, x, y + size * 0.3, Math.round(size * 0.9), lit ? COL.black : col, 'center');
+}
+// Fire taster i omvendt T, som på tastaturet: øverst = mer pådrag, midten nede = mindre,
+// venstre/høyre = roter mot/med klokka.
+function keyCluster(cx, cy, k, size, dim) {
+  const g = size + 3;
+  keycap(cx, cy - g / 2, k.caps.up, anyKey(k.keys.up), size, dim);
+  keycap(cx - g, cy + g / 2, k.caps.left, anyKey(k.keys.left), size, dim);
+  keycap(cx, cy + g / 2, k.caps.down, anyKey(k.keys.down), size, dim);
+  keycap(cx + g, cy + g / 2, k.caps.right, anyKey(k.keys.right), size, dim);
+}
+
+function draw() {
+  const panel = CW >= 900 ? 380 : 0;
+  const mw = CW - panel;
+  ctx.fillStyle = COL.bg;
+  ctx.fillRect(0, 0, CW, CH);
+  drawMap(mw, CH);
+  if (panel) drawPanel(mw, panel, CH);
+  drawOverlay(mw, CH);
+}
+
+function drawMap(mw, mh) {
+  const sc = Math.min(mw, mh) / 2 / (R * 1.06);
+  const cx = mw / 2, cy = mh / 2;
+  const P = (n, e) => [cx + e * sc, cy - n * sc];
+  const blink = Math.floor(visT * 3) % 2 === 0;
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(0, 0, mw, mh);
+  ctx.clip();
+
+  // Rutenett hver 25 m
+  const gs = 25;
+  const gx = Math.ceil(mw / 2 / sc / gs), gy = Math.ceil(mh / 2 / sc / gs);
+  for (let i = -gx; i <= gx; i++) line(cx + i * gs * sc, 0, cx + i * gs * sc, mh, COL.grid);
+  for (let j = -gy; j <= gy; j++) line(0, cy + j * gs * sc, mw, cy + j * gs * sc, COL.grid);
+
+  // Brønnsenter
+  line(cx - 6, cy, cx + 6, cy, COL.dim);
+  line(cx, cy - 6, cx, cy + 6, COL.dim);
+
+  // Grensesirkel
+  const ringCol = S.outPos ? (blink ? COL.red : '#7a1010') : S.clear < 10 ? COL.amber : COL.g;
+  ring(cx, cy, R * sc, ringCol, 2);
+
+  const [rx, ry] = P(S.N, S.E);
+  drawRig(rx, ry, S.psi, sc);
+  drawThrusters(sc, P, rx, ry);
+
+  // Klaring: stiplet linje fra riggens ytterste punkt ut til streken
+  if (S.clear < 25) {
+    const o = outermost(S.N, S.E, S.psi);
+    const [ox, oy] = P(o.n, o.e);
+    const ex = cx + o.e / o.d * R * sc, ey = cy - o.n / o.d * R * sc;
+    const col = S.outPos ? COL.red : COL.amber;
+    line(ox, oy, ex, ey, col, 2, [3, 3]);
+    box(ox - 3, oy - 3, 6, 6, col, col);
+  }
+
+  if (CFG.showForces) {
+    const FPX = 30 / 1e6;   // piksler per newton
+    const F = S.F;
+    if (Math.hypot(F.envN, F.envE) > 2e4) arrow(rx, ry, rx + F.envE * FPX, ry - F.envN * FPX, COL.amber, 2, 10);
+    if (Math.hypot(F.TN, F.TE) > 2e4) arrow(rx, ry, rx + F.TE * FPX, ry - F.TN * FPX, COL.water, 2, 10);
+  }
+
+  drawEnvBox();
+
+  // Tid og alarm
+  T(`TID ${fmtTime(S.clock)}`, mw / 2, 34, 34, COL.g, 'center');
+  T(`REKORD ${fmtTime(best)}${PROGRESSIVE ? `   NIVÅ ${S.level}` : ''}`, mw / 2, 54, 18, COL.dim, 'center');
+  if (S.phase === 'running' && S.outside > 0) {
+    const what = S.outPos && S.outHead ? 'OVER STREKEN + KURS' : S.outPos ? 'RIGGEN ER OVER STREKEN' : 'KURSAVVIK';
+    if (blink) {
+      box(mw / 2 - 190, 64, 380, 30, COL.red, COL.black, 2);
+      T(`*** ${what} ${Math.max(0, LOSE_TIME - S.outside).toFixed(1)} S ***`, mw / 2, 86, 22, COL.red, 'center');
+    }
+  } else if (S.phase === 'running' && S.t < RAMP_TIME) {
+    T('VÆRET BYGGER SEG OPP ...', mw / 2, 84, 18, COL.dim, 'center');
+  }
+
+  // Meldinger
+  S.msgs.forEach((m, k) => {
+    const y = mh - 34 - (S.msgs.length - 1 - k) * 28;
+    ctx.font = `20px ${FONT}`;
+    const w = ctx.measureText(m.text).width + 24;
+    box(mw / 2 - w / 2, y - 18, w, 24, m.color, COL.black);
+    T(m.text, mw / 2, y, 20, m.color, 'center');
+  });
+
+  // Tegnforklaring og målestokk
+  if (CFG.showForces) {
+    const ly = mh - 12;
+    arrow(12, ly - 5, 36, ly - 5, COL.water, 2, 7);
+    T('THRUSTERE', 42, ly, 17, COL.water);
+    arrow(130, ly - 5, 154, ly - 5, COL.amber, 2, 7);
+    T('MILJØ', 160, ly, 17, COL.amber);
+  }
+  const bar = [10, 20, 25, 50, 100].filter(v => v * sc <= 130).pop() || 10;
+  const bx1 = mw - 16, bx0 = bx1 - bar * sc, by = mh - 18;
+  line(bx0, by, bx1, by, COL.mid);
+  line(bx0, by - 5, bx0, by + 5, COL.mid);
+  line(bx1, by - 5, bx1, by + 5, COL.mid);
+  T(`${bar} M`, (bx0 + bx1) / 2, by - 7, 17, COL.mid, 'center');
+
+  ctx.restore();
+}
+
+function drawRig(x, y, psi, sc) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(psi);
+  // Lokale piksler: kroppens y (styrbord) mot høyre, x (forover) opp
+  const B = (bx, by) => [by * sc, -bx * sc];
+  const lw = 1.5;
+
+  // Pongtonger: avrundede ender, dette er riggens ytterste omriss
+  for (const py of [-PONTOON_Y, PONTOON_Y]) {
+    const [l, t] = B(PONTOON_HALF_LEN, py - PONTOON_R);
+    ctx.beginPath();
+    if (ctx.roundRect) ctx.roundRect(l, t, 2 * PONTOON_R * sc, 2 * PONTOON_HALF_LEN * sc, PONTOON_R * sc);
+    else ctx.rect(l, t, 2 * PONTOON_R * sc, 2 * PONTOON_HALF_LEN * sc);
+    ctx.fillStyle = COL.bg;
+    ctx.fill();
+    ctx.strokeStyle = COL.g;
+    ctx.lineWidth = lw;
+    ctx.stroke();
+  }
+  // Dekk
+  const [dl, dt] = B(DECK_X, -DECK_Y);
+  ctx.fillStyle = COL.bg;
+  ctx.fillRect(dl, dt, 2 * DECK_Y * sc, 2 * DECK_X * sc);
+  ctx.strokeStyle = COL.g;
+  ctx.lineWidth = lw;
+  ctx.strokeRect(dl, dt, 2 * DECK_Y * sc, 2 * DECK_X * sc);
+  // Søyler
+  for (const bx of [-40, 40]) for (const by of [-35, 35]) {
+    const [cx, cy] = B(bx, by);
+    ring(cx, cy, 7.5 * sc, COL.dim, 1);
+  }
+  // Helidekk forut babord
+  const [hx, hy] = B(28, -25);
+  ctx.beginPath();
+  for (let k = 0; k < 8; k++) {
+    const a = k * Math.PI / 4 + Math.PI / 8;
+    const px = hx + Math.cos(a) * 11 * sc, py = hy + Math.sin(a) * 11 * sc;
+    if (k === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+  }
+  ctx.closePath();
+  ctx.strokeStyle = COL.dim;
+  ctx.lineWidth = 1;
+  ctx.stroke();
+  T('H', hx, hy + 7 * sc * 0.5, Math.max(14, 12 * sc), COL.dim, 'center');
+  // Boligkvarter og rørdekk
+  const [ql, qt] = B(42, 5);
+  ctx.strokeRect(ql, qt, 35 * sc, 13 * sc);
+  const [pl, pt] = B(-22, -36);
+  ctx.strokeRect(pl, pt, 72 * sc, 18 * sc);
+  // Boretårn
+  const s8 = 8 * sc;
+  ctx.strokeStyle = COL.mid;
+  ctx.strokeRect(-s8, -s8, 2 * s8, 2 * s8);
+  line(-s8, -s8, s8, s8, COL.mid);
+  line(s8, -s8, -s8, s8, COL.mid);
+  // Baugmarkering
+  ctx.beginPath();
+  ctx.moveTo(...B(54, 0)); ctx.lineTo(...B(47, -5)); ctx.lineTo(...B(47, 5));
+  ctx.closePath();
+  ctx.fillStyle = COL.amber;
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawThrusters(sc, P, rx, ry) {
+  const c = Math.cos(S.psi), s = Math.sin(S.psi);
+  const pod = clamp(4 * sc, 6, 12);
+  S.thr.forEach((th, i) => {
+    const d = THRUSTERS[i];
+    const [x, y] = P(S.N + d.x * c - d.y * s, S.E + d.x * s + d.y * c);
+    const sel = CFG.mode === 'select' && selected[i];
+    const col = th.failed > 0 ? COL.red : sel ? COL.amber : COL.g;
+
+    // Pilene viser vannstrømmen fra thrusteren (riggen skyves motsatt vei).
+    // Bestilt retning er stiplet rav, faktisk er blå pil.
+    const ac = S.psi + th.aziCmd + Math.PI;
+    line(x, y, x + Math.sin(ac) * (pod + 20), y - Math.cos(ac) * (pod + 20), COL.amber, 1, [2, 3]);
+    ring(x, y, pod, col, sel ? 2 : 1.5, null, COL.bg);
+    const a = S.psi + th.azi + Math.PI;
+    const len = pod + 4 + th.act * 40;
+    if (th.act > 0.01) arrow(x, y, x + Math.sin(a) * len, y - Math.cos(a) * len, th.failed > 0 ? COL.red : COL.water, 2, 7);
+
+    // Navn utenfor riggen (bare tekst, så omrisset ikke skjules)
+    let ox = x - rx, oy = y - ry;
+    const ol = Math.hypot(ox, oy) || 1;
+    ox /= ol; oy /= ol;
+    const lx = x + ox * (pod + 36), ly = y + oy * (pod + 30);
+    const hint = CFG.mode === 'direct'
+      ? `${d.caps.up}${d.caps.left}${d.caps.down}${d.caps.right}`
+      : `[${i + 1}]`;
+    T(d.name, lx, ly, 24, col, 'center');
+    T(hint, lx, ly + 20, 22, th.failed > 0 ? COL.red : COL.mid, 'center');
+  });
+}
+
+function drawEnvBox() {
+  const F = S.F, e = S.env;
+  const bx = 10, by = 10, bw = 236, bh = 120;
+  box(bx, by, bw, bh, COL.dim, COL.bg);
+  const cx = bx + 56, cy = by + 60, r = 44;
+  ring(cx, cy, r, COL.dim, 1);
+  for (let k = 0; k < 4; k++) {
+    const a = k * Math.PI / 2;
+    line(cx + Math.sin(a) * r, cy - Math.cos(a) * r, cx + Math.sin(a) * (r - 6), cy - Math.cos(a) * (r - 6), COL.dim);
+  }
+  T('N', cx, cy - r + 18, 17, COL.dim, 'center');
+  const dirArrow = (ang, len, color) => {
+    const sx = Math.sin(ang), sy = -Math.cos(ang);
+    arrow(cx - sx * len * 0.7, cy - sy * len * 0.7, cx + sx * len, cy + sy * len, color, 2, 7);
+  };
+  dirArrow(e.waveFrom + Math.PI, 30, COL.water);
+  dirArrow(F.cTo, 22, COL.amber);
+  dirArrow(e.windFrom + Math.PI, 38, COL.g);
+
+  const lx = bx + 112;
+  T('VIND', lx, by + 22, 18, COL.g);
+  T(`${F.ws.toFixed(1)} M/S ${fmt3(e.windFrom)}°`, lx, by + 38, 17, COL.mid);
+  T('BØLGER', lx, by + 60, 18, COL.water);
+  T(`HS ${F.hs.toFixed(1)} M ${fmt3(e.waveFrom)}°`, lx, by + 76, 17, COL.mid);
+  T('STRØM', lx, by + 98, 18, COL.amber);
+  T(`${F.cs.toFixed(2)} M/S →${fmt3(F.cTo)}°`, lx, by + 114, 17, COL.mid);
+}
+
+function drawPanel(x0, w, h) {
+  line(x0 + 0.5, 0, x0 + 0.5, h, COL.dim);
+  const px = x0 + 14, pw = w - 28;
+  const F = S.F;
+  const blink = Math.floor(visT * 3) % 2 === 0;
+
+  T('DP-KONSOLL', px, 26, 22, COL.g);
+  T(`[${WX.name.toUpperCase()}]`, px + pw, 26, 22, COL.amber, 'right');
+  line(px, 34, px + pw, 34, COL.dim);
+
+  // Klaring til streken
+  let y = 56;
+  const pc = S.clear < 0 ? COL.red : S.clear < 10 ? COL.amber : COL.g;
+  T('KLARING TIL STREKEN', px, y, 18, COL.dim);
+  y += 28;
+  T(`${S.clear.toFixed(1)} M`, px, y, 34, pc);
+  T(`SENTER ${Math.hypot(S.N, S.E).toFixed(1)} M`, px + pw, y - 16, 17, COL.mid, 'right');
+  T(`FART ${Math.hypot(S.vN, S.vE).toFixed(2)} M/S`, px + pw, y, 17, COL.mid, 'right');
+  y += 8;
+  segBar(px, y, pw, 8, S.clear / (R - RIG_RADIUS), pc, 30);
+
+  // Kurs
+  y += 34;
+  const hErr = wrapPi(S.psi) / DEG;
+  const hc = !HEAD_RULE ? COL.g
+    : Math.abs(hErr) > HTOL ? COL.red : Math.abs(hErr) > HTOL / 2 ? COL.amber : COL.g;
+  T('KURS', px, y, 18, COL.dim);
+  y += 28;
+  T(`${fmtHdg(S.psi)}°`, px, y, 34, hc);
+  T(HEAD_RULE ? `MÅL 000° ±${HTOL}°` : 'KURSREGEL AV', px + pw, y - 16, 17, HEAD_RULE ? COL.mid : COL.dim, 'right');
+  T(`GIR ${(S.r / DEG * 60).toFixed(1)} °/MIN`, px + pw, y, 17, COL.mid, 'right');
+  y += 8;
+  // Uten kursregel viser stolpen ±90°
+  const span = HEAD_RULE ? 3 * HTOL : 90;
+  box(px, y, pw, 8, COL.dim);
+  if (HEAD_RULE) {
+    const tolW = pw * HTOL / span;
+    ctx.fillStyle = COL.grid;
+    ctx.fillRect(px + pw / 2 - tolW / 2, y + 1, tolW, 7);
+    line(px + pw / 2 - tolW / 2, y, px + pw / 2 - tolW / 2, y + 8, COL.dim);
+    line(px + pw / 2 + tolW / 2, y, px + pw / 2 + tolW / 2, y + 8, COL.dim);
+  }
+  const mx = px + pw / 2 + pw / 2 * clamp(hErr / span, -1, 1);
+  ctx.fillStyle = hc;
+  ctx.fillRect(mx - 2, y - 4, 4, 16);
+
+  // Thrustere
+  y += 36;
+  T('THRUSTERE', px, y, 18, COL.dim);
+  T(`${(Math.hypot(F.TN, F.TE) / 1e6).toFixed(2)} MN  MILJØ ${(Math.hypot(F.envN, F.envE) / 1e6).toFixed(2)} MN`,
+    px + pw, y, 17, COL.mid, 'right');
+  y += 8;
+  S.thr.forEach((th, i) => {
+    const d = THRUSTERS[i];
+    const ch = 94, y0 = y;
+    const sel = CFG.mode === 'select' && selected[i];
+    const bc = th.failed > 0 ? (blink ? COL.red : COL.dim) : sel ? COL.amber : COL.dim;
+    box(px, y0, pw, ch, bc, null, sel || th.failed > 0 ? 2 : 1);
+
+    // Retningsskive (baug opp). Pilen viser vannstrømmen, som på kartet.
+    const jet = th.azi + Math.PI, jetCmd = th.aziCmd + Math.PI;
+    const dx = px + 36, dy = y0 + ch / 2, dr = 26;
+    ring(dx, dy, dr, COL.dim, 1);
+    line(dx, dy - dr, dx, dy - dr + 6, COL.amber, 2);
+    line(dx, dy, dx + Math.sin(jetCmd) * dr, dy - Math.cos(jetCmd) * dr, COL.amber, 1, [2, 3]);
+    const nl = 6 + (dr - 8) * Math.max(0.25, th.act);
+    arrow(dx, dy, dx + Math.sin(jet) * nl, dy - Math.cos(jet) * nl, th.failed > 0 ? COL.red : COL.water, 2, 6);
+
+    // Tekst og pådragsstolpe
+    const tx = px + 72, tw = pw - 72 - 120;
+    T(`${d.name} ${d.label}`, tx, y0 + 22, 20, th.failed > 0 ? COL.red : COL.g);
+    if (th.failed > 0 && blink) T('FEIL', tx + tw, y0 + 22, 20, COL.red, 'right');
+    const by = y0 + 32;
+    segBar(tx, by, tw, 10, th.act, th.failed > 0 ? COL.red : COL.water, 16);
+    ctx.fillStyle = COL.amber;
+    ctx.fillRect(tx + tw * th.cmd - 1, by - 3, 2, 16);
+    T(`PÅDRAG ${String(Math.round(th.act * 100)).padStart(3)}%`, tx, by + 28, 17, COL.g);
+    T(`→${String(Math.round(th.cmd * 100)).padStart(3)}%`, tx + tw, by + 28, 17, COL.amber, 'right');
+    T(`RETNING ${fmt3(jet)}°`, tx, by + 46, 17, COL.g);
+    T(`→${fmt3(jetCmd)}°`, tx + tw, by + 46, 17, COL.amber, 'right');
+
+    // Taster
+    const kx = px + pw - 56, ky = y0 + ch / 2 + 2;
+    if (CFG.mode === 'direct') keyCluster(kx, ky, d, 32, th.failed > 0);
+    else keycap(kx, ky, String(i + 1), sel, 42);
+    y += ch + 6;
+  });
+
+  // Forklaring av tastene
+  const ky = y + 36, kx = px + 46;
+  keyCluster(kx, ky, CFG.mode === 'direct'
+    ? { caps: { up: '+', down: '-', left: '<', right: '>' }, keys: { up: [], down: [], left: [], right: [] } }
+    : SELECT_KEYS, 28, false);
+  const hx = px + 104;
+  const help = CFG.mode === 'direct'
+    ? ['ØVERST: MER PÅDRAG', 'MIDTEN: MINDRE PÅDRAG', 'VENSTRE/HØYRE: ROTER']
+    : ['1-4: VELG THRUSTER, 5: ALLE', '↑/↓: PÅDRAG', '←/→: ROTER'];
+  help.forEach((l, k) => T(l, hx, y + 20 + k * 18, 18, COL.mid));
+  T('SHIFT: FINJUSTER  MELLOMROM: PAUSE', hx, y + 20 + 3 * 18, 16, COL.dim);
+}
+
+function renderLines(lines, x, y, maxW, doDraw) {
+  for (const L of lines) {
+    const size = L.s || 20;
+    ctx.font = `${size}px ${FONT}`;
+    const lh = size * 1.15;
+    const out = [];
+    let cur = '';
+    for (const word of L.t.split(' ')) {
+      const test = cur ? cur + ' ' + word : word;
+      if (ctx.measureText(test).width > maxW && cur) { out.push(cur); cur = word; } else cur = test;
+    }
+    out.push(cur);
+    for (const o of out) {
+      y += lh;
+      if (doDraw) {
+        ctx.fillStyle = L.c || COL.g;
+        ctx.textAlign = L.a || 'left';
+        ctx.fillText(o, L.a === 'center' ? x + maxW / 2 : x, y - lh * 0.22);
+      }
+    }
+    y += L.gap || 0;
+  }
+  return y;
+}
+
+function drawOverlay(mw, mh) {
+  if (S.phase === 'running') return;
+  ctx.fillStyle = 'rgba(0,8,5,0.8)';
+  ctx.fillRect(0, 0, mw, mh);
+  const blink = Math.floor(visT * 2) % 2 === 0;
+
+  let lines;
+  if (S.phase === 'intro') {
+    const ctrl = CFG.mode === 'direct'
+      ? [
+        'HVER THRUSTER HAR FIRE TASTER I EN OMVENDT T:',
+        '  T1 BAUG BB : W A S D    T2 BAUG SB : I J K L',
+        '  T3 AKTER BB: T F G H    T4 AKTER SB: ↑ ← ↓ →',
+        'ØVERST = MER PÅDRAG, MIDTEN = MINDRE, SIDENE = ROTER.',
+      ]
+      : [
+        '1-4: VELG ELLER FJERN THRUSTER (5 = ALLE)',
+        '↑/↓: PÅDRAG FOR VALGTE',
+        '←/→: ROTER VALGTE',
+      ];
+    lines = [
+      { t: 'DP-SIMULATOR : SEMISUB', s: 40, a: 'center', gap: 2 },
+      { t: `VÆR ${WX.name.toUpperCase()}  RADIUS ${R} M  ${HEAD_RULE ? `KURS 000° ±${HTOL}°` : 'KURSREGEL AV'}`, s: 20, c: COL.amber, a: 'center', gap: 14 },
+      ...(HEAD_RULE ? [
+        { t: 'HOLD HELE RIGGEN INNENFOR STREKEN OG BAUGEN MOT NORD.', gap: 4 },
+        { t: `GÅR EN DEL AV RIGGEN OVER STREKEN, ELLER KURSEN UTENFOR ±${HTOL}°, I MER ENN ${LOSE_TIME} S, ER SPILLET OVER. OVER ${3 * HTOL}° KURSAVVIK GIR NØDFRAKOBLING MED EN GANG.`, gap: 4 },
+      ] : [
+        { t: 'HOLD HELE RIGGEN INNENFOR STREKEN. KURSEN ER FRI, MEN NÅR RIGGEN DREIER, FLYTTER HJØRNENE SEG.', gap: 4 },
+        { t: `GÅR EN DEL AV RIGGEN OVER STREKEN I MER ENN ${LOSE_TIME} S, ER SPILLET OVER.`, gap: 4 },
+      ]),
+      ...(PROGRESSIVE ? [{ t: `VÆRET BLIR VERRE HVERT ${LEVEL_TIME}. SEKUND. HVOR LENGE HOLDER DU UT?`, c: COL.amber, gap: 4 }] : []),
+      { t: 'BLÅ PIL PÅ THRUSTER = VANNSTRØMMEN, RIGGEN SKYVES MOTSATT VEI. RAV STIPLET = BESTILT RETNING. STOR BLÅ PIL I MIDTEN = SAMLET THRUSTERKRAFT PÅ RIGGEN.', gap: 14 },
+      ...ctrl.map(t => ({ t, c: COL.mid })),
+      { t: '', gap: 6 },
+      { t: blink ? '> KLIKK ELLER TRYKK MELLOMROM FOR Å STARTE <' : '', s: 24, c: COL.amber, a: 'center' },
+    ];
+  } else if (S.phase === 'paused') {
+    lines = [
+      { t: 'PAUSE', s: 40, a: 'center', gap: 10 },
+      { t: blink ? '> KLIKK ELLER MELLOMROM FOR Å FORTSETTE <' : '', s: 22, c: COL.amber, a: 'center', gap: 4 },
+      { t: 'R: NY RUNDE', c: COL.mid, a: 'center' },
+    ];
+  } else {
+    lines = [
+      { t: S.title, s: 40, c: COL.red, a: 'center', gap: 6 },
+      { t: S.reason, a: 'center', gap: 14 },
+      { t: `TID ${fmtTime(S.clock)}`, s: 34, a: 'center' },
+      S.newBest
+        ? { t: '*** NY REKORD ***', s: 24, c: COL.amber, a: 'center' }
+        : { t: `REKORD ${fmtTime(best)}`, c: COL.mid, a: 'center' },
+      { t: `MINSTE KLARING ${S.minClear.toFixed(1)} M${PROGRESSIVE ? `   NÅDDE NIVÅ ${S.level}` : ''}`, c: COL.mid, a: 'center', gap: 16 },
+      { t: blink ? '> KLIKK, MELLOMROM ELLER R FOR NY RUNDE <' : '', s: 22, c: COL.amber, a: 'center' },
+    ];
+  }
+
+  const bw = Math.min(600, mw - 40), pad = 22;
+  const bh = renderLines(lines, 0, 0, bw - 2 * pad, false) + 2 * pad;
+  const bx = (mw - bw) / 2, by = Math.max(10, (mh - bh) / 2);
+  box(bx, by, bw, bh, COL.g, COL.bg, 2);
+  box(bx + 5, by + 5, bw - 10, bh - 10, COL.dim);
+  renderLines(lines, bx + pad, by + pad, bw - 2 * pad, true);
+}
+
+// ---------------------------------------------------------------------------
+// Hovedløkke
+// ---------------------------------------------------------------------------
+newGame('intro');
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.1, (now - last) / 1000);
+  last = now;
+  visT += dt;
+  if (S.phase === 'running') {
+    S.clock += dt;
+    let acc = dt * SPEED;
+    while (acc > 1e-9 && S.phase === 'running') {
+      const h = Math.min(acc, 1 / 60);
+      step(h);
+      acc -= h;
+    }
+  }
+  draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
