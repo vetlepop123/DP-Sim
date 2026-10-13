@@ -98,8 +98,26 @@ config = {
     "height": GAME_HEIGHT,
 }
 
-html = GAME_FILE.read_text(encoding="utf-8").replace("__CONFIG__", json.dumps(config))
-st.iframe(html, height=GAME_HEIGHT)
+
+def start_with_name():
+    """Kalles fra Start-knappen. Kjøres før neste kjøring, så navnefeltet i menyen kan settes her."""
+    name = leaderboard.clean_name(st.session_state.get("name_entry"))
+    st.session_state.player_name = name
+    st.session_state.name_missing = not name
+
+
+# Spillet vises først når spilleren har skrevet inn et navn
+if leaderboard.clean_name(st.session_state.get("player_name")):
+    html = GAME_FILE.read_text(encoding="utf-8").replace("__CONFIG__", json.dumps(config))
+    st.iframe(html, height=GAME_HEIGHT)
+else:
+    with st.form("name_form"):
+        st.markdown("#### Skriv inn navnet ditt for å starte")
+        st.text_input("Spillernavn", key="name_entry", max_chars=leaderboard.NAME_MAX,
+                      placeholder="Navnet som vises på ledertavlen")
+        st.form_submit_button("Start", type="primary", on_click=start_with_name)
+    if st.session_state.get("name_missing"):
+        st.error("Du må skrive inn et navn for å spille.")
 
 # --- Ledertavle --------------------------------------------------------------
 # Resultatet fra spillet tas vare på til det er lagret, slik at man kan skrive inn
@@ -136,7 +154,7 @@ if pending and pending["id"] not in saved_ids:
             st.error(f"Kunne ikke lagre resultatet: {e}")
     else:
         mins, secs = divmod(int(pending["time_s"]), 60)
-        st.warning(f"Du holdt ut i {mins:02d}:{secs:02d}. Skriv inn navnet ditt i menyen til venstre, "
+        st.warning(f"Du holdt ut i {mins:02d}:{secs:02d}. Skriv inn navnet ditt, "
                    "så lagres resultatet på ledertavlen.")
 
 st.subheader("🏆 Ledertavle")

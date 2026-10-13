@@ -36,7 +36,7 @@ Every round starts in hurricane-force weather (Orkan) that gets worse every 30 s
 
 ## Leaderboard
 
-Enter your name in the sidebar. When a round ends, your time is saved to the leaderboard under the game. If you forgot the name, type it afterwards and the result is saved then. Each combination of the settings that affect difficulty (game speed, heading rule, thruster failures) has its own list.
+You have to enter a name before the game appears; you can change it later in the sidebar. When a round ends, your time is saved to the leaderboard under the game. Each combination of the settings that affect difficulty (game speed, heading rule, thruster failures) has its own list.
 
 Without any setup, results are stored in a local file (`leaderboard_local.json`), which is fine for testing on one PC. For a shared leaderboard online, set up Supabase and Streamlit Community Cloud:
 
