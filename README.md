@@ -34,10 +34,33 @@ Shift gives fine adjustment, Space pauses and R starts a new round. There is als
 
 Weather (Storm or Orkan), progressive weather, circle radius, heading rule, game speed, force vectors and random thruster failures.
 
+## Leaderboard
+
+Enter your name in the sidebar. When a round ends, your time is saved to the leaderboard under the game. If you forgot the name, type it afterwards and the result is saved then. Each combination of settings that affects difficulty (weather, radius, speed, progressive weather, heading rule, thruster failures) has its own list.
+
+Without any setup, results are stored in a local file (`leaderboard_local.json`), which is fine for testing on one PC. For a shared leaderboard online, set up Supabase and Streamlit Community Cloud:
+
+1. **Supabase database (free):** create a project at [supabase.com](https://supabase.com). Open **SQL Editor → New query**, paste the contents of `supabase_setup.sql` and click **Run**. This creates the `scores` table. Anyone can add and read scores, but nobody can edit or delete them through the API.
+2. **Keys:** in Supabase, open **Project Settings → API** and copy the **Project URL** and the **anon** (or **publishable**) key.
+3. **Deploy:** go to [share.streamlit.io](https://share.streamlit.io), click **Create app**, and choose the repo `vetlepop123/DP-Sim`, branch `main`, main file `simulator.py`.
+4. **Secrets:** under **Advanced settings → Secrets** (or later under **App settings → Secrets**), paste:
+
+   ```toml
+   [supabase]
+   url = "https://YOUR-PROJECT.supabase.co"
+   key = "YOUR-ANON-OR-PUBLISHABLE-KEY"
+   ```
+
+5. Share the app link. Everyone who plays there writes to the same leaderboard.
+
+To use Supabase when running locally, copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` and fill in the same values. That file is in `.gitignore` and is never committed.
+
 ## Files
 
-- `simulator.py`: the Streamlit page with settings and weather levels.
+- `simulator.py`: the Streamlit page with settings, weather levels and the leaderboard.
 - `game.html`: the game itself (physics, graphics and keyboard) in JavaScript. The physical constants are at the top of the file.
+- `leaderboard.py`: saves and reads results (Supabase, or a local JSON file when no secrets are set).
+- `supabase_setup.sql`: creates the leaderboard table in Supabase.
 
 ## Physics
 

@@ -8,12 +8,31 @@ Kjør med:
 """
 
 import json
+from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
+import streamlit.components.v2 as components_v2
+
+import leaderboard
 
 GAME_FILE = Path(__file__).with_name("game.html")
 GAME_HEIGHT = 780
+
+# Usynlig komponent som tar imot resultatet fra spillet (postMessage fra iframen)
+# og sender det videre til Python som en trigger-verdi.
+RESULT_BRIDGE_JS = """
+export default function(component) {
+    const { setTriggerValue } = component;
+    const onMessage = (ev) => {
+        const d = ev.data;
+        if (d && d.type === 'dpsim-result') setTriggerValue('result', d);
+    };
+    window.addEventListener('message', onMessage);
+    return () => window.removeEventListener('message', onMessage);
+}
+"""
+result_bridge = components_v2.component("dpsim_result_bridge", js=RESULT_BRIDGE_JS)
 
 # Værnivåer. wind [m/s], gust = relativt standardavvik på vindkast,
 # hs = signifikant bølgehøyde [m], current [m/s], dir_var = vindretningsstøy [grader],
@@ -33,6 +52,8 @@ CONTROL_MODES = {
 st.set_page_config(page_title="DP-simulator", page_icon="⚓", layout="wide")
 
 with st.sidebar:
+    st.text_input("Spillernavn (til ledertavlen)", key="player_name", max_chars=leaderboard.NAME_MAX,
+                  placeholder="Skriv navnet ditt")
     st.header("Innstillinger")
     level = st.radio("Vær", list(WEATHER), index=list(WEATHER).index("Orkan"), horizontal=True)
     w = WEATHER[level]
@@ -55,10 +76,23 @@ with st.sidebar:
 st.title("⚓ DP-simulator: semisub")
 st.write(
     "Klikk på spillet for å gi det tastaturfokus. Hold hele riggen innenfor sirkelen så lenge du klarer. "
-    "Rekorden lagres i nettleseren for hver kombinasjon av vær, radius og kurstoleranse."
+    "Når runden er over, havner tiden din på ledertavlen under spillet."
+)
+
+# Ledertavlen har én liste per kombinasjon av innstillinger som påvirker vanskeligheten
+category = "-".join(
+    [level.lower(), f"r{radius}", f"x{speed:g}", "prog" if progressive else "fast",
+     f"kurs{heading_tol}" if heading_rule else "kursfri"]
+    + (["feil"] if failures else [])
+)
+category_label = " · ".join(
+    [level, f"{radius} m", f"{speed:g}x fart", "progressivt vær" if progressive else "fast vær",
+     f"kurs ±{heading_tol}°" if heading_rule else "uten kursregel"]
+    + (["thrusterfeil"] if failures else [])
 )
 
 config = {
+    "category": category,
     "weather": {
         "name": level,
         "wind": w["wind"],
@@ -81,6 +115,68 @@ config = {
 
 html = GAME_FILE.read_text(encoding="utf-8").replace("__CONFIG__", json.dumps(config))
 st.iframe(html, height=GAME_HEIGHT)
+
+# --- Ledertavle --------------------------------------------------------------
+# Resultatet fra spillet tas vare på til det er lagret, slik at man kan skrive inn
+# navnet etter runden. Hver runde har en unik id, så den lagres bare én gang.
+result = result_bridge(key="result_bridge", on_result_change=lambda: None).result
+saved_ids = st.session_state.setdefault("saved_ids", set())
+if isinstance(result, dict) and result.get("id") not in saved_ids:
+    try:
+        st.session_state.pending = {
+            "id": str(result["id"])[:40],
+            "time_s": float(min(max(result["time_s"], 0), 35999)),
+            "level": int(min(max(result.get("level", 1), 1), 10000)),
+            "category": str(result.get("category", category))[:100],
+            # Innstillingene runden ble spilt med (kategorien kommer fra spillet selv)
+            "settings": {"weather": level, "radius": radius, "speed": speed, "progressive": progressive,
+                         "heading_rule": heading_rule, "heading_tol": heading_tol, "failures": failures,
+                         "mode": config["mode"]},
+        }
+    except (KeyError, TypeError, ValueError):
+        pass
+
+pending = st.session_state.get("pending")
+if pending and pending["id"] not in saved_ids:
+    name = leaderboard.clean_name(st.session_state.get("player_name"))
+    if name:
+        try:
+            leaderboard.add_score({"name": name, "time_s": pending["time_s"], "level": pending["level"],
+                                   "category": pending["category"], **pending["settings"]})
+            saved_ids.add(pending["id"])
+            st.session_state.pending = None
+            mins, secs = divmod(int(pending["time_s"]), 60)
+            st.toast(f"Lagret på ledertavlen: {name}, {mins:02d}:{secs:02d}", icon="🏆")
+        except Exception as e:
+            st.error(f"Kunne ikke lagre resultatet: {e}")
+    else:
+        mins, secs = divmod(int(pending["time_s"]), 60)
+        st.warning(f"Du holdt ut i {mins:02d}:{secs:02d}. Skriv inn navnet ditt i menyen til venstre, "
+                   "så lagres resultatet på ledertavlen.")
+
+st.subheader("🏆 Ledertavle")
+st.caption(f"{category_label}. Hver kombinasjon av innstillinger har sin egen liste.")
+try:
+    rows = leaderboard.top_scores(category)
+except Exception as e:
+    rows = []
+    st.error(f"Kunne ikke hente ledertavlen: {e}")
+if rows:
+    me = leaderboard.clean_name(st.session_state.get("player_name")).lower()
+    table = [
+        {"#": i + 1,
+         "Navn": r["name"] + (" ◀" if me and r["name"].lower() == me else ""),
+         "Tid": f"{int(r['time_s']) // 60:02d}:{int(r['time_s']) % 60:02d}",
+         "Nivå": r.get("level", 1),
+         "Dato": datetime.fromisoformat(r["created_at"].replace("Z", "+00:00")).strftime("%d.%m.%Y")}
+        for i, r in enumerate(rows)
+    ]
+    st.dataframe(table, hide_index=True, width="stretch")
+elif not st.session_state.get("pending"):
+    st.info("Ingen resultater i denne kategorien ennå. Bli den første!")
+if leaderboard.backend_name() != "Supabase":
+    st.caption("Resultatene lagres foreløpig i en lokal fil (leaderboard_local.json). "
+               "Sett opp Supabase for en felles ledertavle, se README.")
 
 col1, col2 = st.columns(2)
 with col1:

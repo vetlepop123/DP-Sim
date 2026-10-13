@@ -355,6 +355,16 @@ function gameOver(title, reason) {
     saveBest(best);
     S.newBest = true;
   }
+  // Send resultatet til Streamlit-siden, som lagrer det på ledertavlen
+  try {
+    window.parent.postMessage({
+      type: 'dpsim-result',
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+      time_s: Math.round(S.clock * 10) / 10,
+      level: S.level,
+      category: CFG.category,
+    }, '*');
+  } catch (e) { /* kjører utenfor Streamlit */ }
 }
 
 // ---------------------------------------------------------------------------
@@ -877,7 +887,8 @@ function drawOverlay(mw, mh) {
       S.newBest
         ? { t: '*** NY REKORD ***', s: 24, c: COL.amber, a: 'center' }
         : { t: `REKORD ${fmtTime(best)}`, c: COL.mid, a: 'center' },
-      { t: `MINSTE KLARING ${S.minClear.toFixed(1)} M${PROGRESSIVE ? `   NÅDDE NIVÅ ${S.level}` : ''}`, c: COL.mid, a: 'center', gap: 16 },
+      { t: `MINSTE KLARING ${S.minClear.toFixed(1)} M${PROGRESSIVE ? `   NÅDDE NIVÅ ${S.level}` : ''}`, c: COL.mid, a: 'center', gap: 4 },
+      { t: 'RESULTATET ER SENDT TIL LEDERTAVLEN UNDER SPILLET', s: 18, c: COL.dim, a: 'center', gap: 14 },
       { t: blink ? '> KLIKK, MELLOMROM ELLER R FOR NY RUNDE <' : '', s: 22, c: COL.amber, a: 'center' },
     ];
   }
